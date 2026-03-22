@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +22,9 @@ import (
 	ccconnect "github.com/chenhg5/cc-connect"
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
+	"github.com/chenhg5/cc-connect/core/identity"
+	"github.com/chenhg5/cc-connect/core/memory"
+	"github.com/chenhg5/cc-connect/core/profile"
 	"github.com/chenhg5/cc-connect/daemon"
 	// Agent and platform imports are in separate plugin_*.go files
 	// controlled by build tags. See Makefile for selective compilation.
@@ -194,6 +201,97 @@ func main() {
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
+
+		// Wire identity (personality) system
+		idDir := filepath.Join(cfg.DataDir, "bot", proj.Name)
+		if err := os.MkdirAll(idDir, 0o755); err != nil {
+			slog.Warn("failed to create identity directory", "path", idDir, "err", err)
+		} else {
+			if created, err := identity.EnsureDefaultFiles(idDir); err != nil {
+				slog.Warn("failed to ensure identity files", "err", err)
+			} else if len(created) > 0 {
+				slog.Info("created default identity files", "project", proj.Name, "files", created)
+			}
+			idMgr := identity.NewManager(idDir)
+			if err := idMgr.LoadAll(); err != nil {
+				slog.Warn("failed to load identity files", "project", proj.Name, "err", err)
+			} else {
+				engine.SetIdentityManager(idMgr)
+				slog.Debug("identity system initialized", "project", proj.Name)
+			}
+		}
+
+		// Wire profile (user/group) system
+		{
+			profileDir := filepath.Join(cfg.DataDir, "bot", proj.Name)
+			if err := os.MkdirAll(profileDir, 0o755); err != nil {
+				slog.Warn("failed to create profile directory", "path", profileDir, "err", err)
+			} else {
+				if created, err := profile.EnsureDefaultFile(profileDir); err != nil {
+					slog.Warn("failed to ensure profile file", "err", err)
+				} else if created {
+					slog.Info("created default profile file", "project", proj.Name)
+				}
+				profileMgr := profile.NewManager(profileDir)
+				if err := profileMgr.Load(); err != nil {
+					slog.Warn("failed to load profiles", "project", proj.Name, "err", err)
+				} else {
+					engine.SetProfileManager(profileMgr)
+					slog.Debug("profile system initialized", "project", proj.Name)
+				}
+			}
+		}
+
+		// Wire memory system
+		{
+			memDir := filepath.Join(cfg.DataDir, "bot", proj.Name)
+			if err := os.MkdirAll(memDir, 0o755); err != nil {
+				slog.Warn("failed to create memory directory", "path", memDir, "err", err)
+			} else {
+				if created, err := memory.EnsureDefaultFiles(memDir); err != nil {
+					slog.Warn("failed to ensure memory files", "err", err)
+				} else if created {
+					slog.Info("created default memory files", "project", proj.Name)
+				}
+
+				// Check if memory is enabled (global or project-level)
+				memCfg := cfg.Memory
+				if proj.Memory != nil {
+					memCfg = *proj.Memory
+				}
+				memEnabled := memCfg.Enabled != nil && *memCfg.Enabled
+
+				if memEnabled {
+					// Create memory provider (file-based, no vectors)
+					store := memory.NewStoreFS(memDir, nil, slog.Default())
+					engine.SetMemoryProvider(store)
+
+					// Create LLM extractor if configured
+					if memCfg.APIKey != "" && memCfg.Provider != "" {
+						extractor := createMemoryExtractor(memCfg)
+						if extractor != nil {
+							store.SetExtractor(extractor)
+							slog.Info("memory system enabled", "project", proj.Name, "provider", memCfg.Provider, "mode", memCfg.Mode)
+
+							// Create LLM decider and compactor for intelligent memory management
+							client := createMemoryLLMClient(memCfg)
+							if client != nil {
+								store.SetDecider(memory.NewLLMDecider(client))
+								store.SetCompactor(memory.NewLLMCompactor(client))
+								slog.Debug("memory decider and compactor enabled", "project", proj.Name)
+							}
+						} else {
+							slog.Warn("memory system enabled but extractor creation failed", "project", proj.Name)
+						}
+					} else {
+						slog.Info("memory system enabled (no extractor - facts must be added manually)", "project", proj.Name)
+						// Use simple decider/compactor (rule-based, no LLM)
+						store.SetDecider(memory.NewSimpleDecider())
+						store.SetCompactor(memory.NewSimpleCompactor())
+					}
+				}
+			}
+		}
 
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
@@ -1119,4 +1217,168 @@ func derefInt(v *int) int {
 		return 0
 	}
 	return *v
+}
+
+// createMemoryLLMClient creates an LLM client for memory extraction based on config.
+func createMemoryLLMClient(cfg config.MemoryConfig) memory.LLMClient {
+	if cfg.APIKey == "" || cfg.Provider == "" {
+		return nil
+	}
+
+	switch cfg.Provider {
+	case "openai":
+		baseURL := cfg.BaseURL
+		if baseURL == "" {
+			baseURL = "https://api.openai.com/v1"
+		}
+		model := cfg.Model
+		if model == "" {
+			model = "gpt-4o-mini"
+		}
+		return &openaiLLMClient{
+			apiKey:  cfg.APIKey,
+			baseURL: baseURL,
+			model:   model,
+		}
+	case "anthropic":
+		baseURL := cfg.BaseURL
+		if baseURL == "" {
+			baseURL = "https://api.anthropic.com"
+		}
+		model := cfg.Model
+		if model == "" {
+			model = "claude-3-5-haiku-latest"
+		}
+		return &anthropicLLMClient{
+			apiKey:  cfg.APIKey,
+			baseURL: baseURL,
+			model:   model,
+		}
+	default:
+		slog.Warn("unsupported memory provider", "provider", cfg.Provider)
+		return nil
+	}
+}
+
+// createMemoryExtractor creates a memory extractor from config.
+func createMemoryExtractor(cfg config.MemoryConfig) memory.Extractor {
+	client := createMemoryLLMClient(cfg)
+	if client == nil {
+		return nil
+	}
+	return memory.NewDefaultExtractor(client)
+}
+
+// openaiLLMClient implements memory.LLMClient for OpenAI.
+type openaiLLMClient struct {
+	apiKey  string
+	baseURL string
+	model   string
+}
+
+func (c *openaiLLMClient) ChatComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return callOpenAICompat(ctx, c.apiKey, c.baseURL, c.model, systemPrompt, userPrompt)
+}
+
+// anthropicLLMClient implements memory.LLMClient for Anthropic.
+type anthropicLLMClient struct {
+	apiKey  string
+	baseURL string
+	model   string
+}
+
+func (c *anthropicLLMClient) ChatComplete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return callAnthropicAPI(ctx, c.apiKey, c.baseURL, c.model, systemPrompt, userPrompt)
+}
+
+// callOpenAICompat makes a chat completion request to OpenAI-compatible APIs.
+func callOpenAICompat(ctx context.Context, apiKey, baseURL, model, systemPrompt, userPrompt string) (string, error) {
+	reqBody := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"temperature": 0.3,
+	}
+	data, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/chat/completions", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("no response from API")
+	}
+	return strings.TrimSpace(result.Choices[0].Message.Content), nil
+}
+
+// callAnthropicAPI makes a chat completion request to Anthropic API.
+func callAnthropicAPI(ctx context.Context, apiKey, baseURL, model, systemPrompt, userPrompt string) (string, error) {
+	reqBody := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": userPrompt},
+		},
+		"system":      systemPrompt,
+		"max_tokens":  1024,
+		"temperature": 0.3,
+	}
+	data, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/messages", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result.Content) == 0 {
+		return "", fmt.Errorf("no response from API")
+	}
+	return strings.TrimSpace(result.Content[0].Text), nil
 }

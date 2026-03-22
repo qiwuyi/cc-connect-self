@@ -38,6 +38,19 @@ type Config struct {
 	Bridge          BridgeConfig        `toml:"bridge"`
 	Management      ManagementConfig    `toml:"management"`
 	IdleTimeoutMins *int                `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
+	Memory          MemoryConfig        `toml:"memory"` // memory system configuration
+}
+
+// MemoryConfig controls the cross-session memory system.
+type MemoryConfig struct {
+	Enabled    *bool  `toml:"enabled"`      // enable memory system; default false
+	Mode       string `toml:"mode"`         // "off" (file-based, no vectors); default "off"
+	Provider   string `toml:"provider"`     // LLM provider for fact extraction (e.g., "openai", "anthropic")
+	APIKey     string `toml:"api_key"`      // API key for the LLM provider
+	BaseURL    string `toml:"base_url"`     // optional: custom API endpoint
+	Model      string `toml:"model"`        // model name for extraction (e.g., "gpt-4o-mini", "claude-3-5-haiku-latest")
+	MaxItems   int    `toml:"max_items"`    // max memories to retrieve per query; default 8
+	ExtractLen int    `toml:"extract_len"`  // max chars per extracted fact; default 100
 }
 
 // CronConfig controls cron job behavior.
@@ -186,6 +199,7 @@ type ProjectConfig struct {
 	DisabledCommands []string           `toml:"disabled_commands,omitempty"` // commands to disable for this project (e.g. ["restart", "upgrade"])
 	AdminFrom        string             `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users
 	Users            *UsersConfig       `toml:"users,omitempty"`             // per-user role config; nil = legacy behavior
+	Memory           *MemoryConfig      `toml:"memory,omitempty"`            // project-level memory config; overrides global
 }
 
 type AgentConfig struct {

@@ -18,6 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/chenhg5/cc-connect/core/identity"
+	"github.com/chenhg5/cc-connect/core/memory"
+	"github.com/chenhg5/cc-connect/core/profile"
 )
 
 const maxPlatformMessageLen = 4000
@@ -180,6 +184,16 @@ type Engine struct {
 	eventIdleTimeout time.Duration
 	dirHistory       *DirHistory
 
+	// Memory system
+	memoryProvider memory.Provider
+	memoryEnabled  bool
+
+	// Identity system (bot personality)
+	identityManager *identity.Manager
+
+	// Profile system (user/group profiles)
+	profileManager *profile.Manager
+
 	// Auto-compress settings
 	autoCompressEnabled   bool
 	autoCompressMaxTokens int
@@ -293,6 +307,8 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		startedAt:             time.Now(),
 		streamPreview:         DefaultStreamPreviewCfg(),
 		eventIdleTimeout:      defaultEventIdleTimeout,
+		memoryProvider:        &memory.NoopProvider{}, // default to no-op
+		memoryEnabled:         false,
 	}
 
 	if ag != nil {
@@ -420,6 +436,30 @@ func (e *Engine) SetInjectSender(v bool) {
 // SetAttachmentSendEnabled controls whether side-channel image/file delivery is allowed.
 func (e *Engine) SetAttachmentSendEnabled(v bool) {
 	e.attachmentSendEnabled = v
+}
+
+// SetIdentityManager configures the identity (personality) system.
+// When manager is nil, identity context injection is disabled.
+func (e *Engine) SetIdentityManager(manager *identity.Manager) {
+	e.identityManager = manager
+}
+
+// SetMemoryProvider configures the memory provider for cross-session memory.
+// When provider is nil, memory system is disabled.
+func (e *Engine) SetMemoryProvider(provider memory.Provider) {
+	if provider == nil {
+		e.memoryProvider = &memory.NoopProvider{}
+		e.memoryEnabled = false
+	} else {
+		e.memoryProvider = provider
+		e.memoryEnabled = true
+	}
+}
+
+// SetProfileManager configures the profile manager for user/group profiles.
+// When manager is nil, profile lookup is disabled.
+func (e *Engine) SetProfileManager(manager *profile.Manager) {
+	e.profileManager = manager
 }
 
 func (e *Engine) SetLanguageSaveFunc(fn func(Language) error) {
@@ -1660,6 +1700,46 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.Platform, msg.SessionKey)
 
+	// Memory: retrieve relevant context before sending to agent
+	if e.memoryEnabled && e.memoryProvider != nil {
+		req := memory.BeforeChatRequest{
+			Query:     msg.Content,
+			SessionID: msg.SessionKey,
+			Platform:  msg.Platform,
+			UserID:    msg.UserID,
+			ChatID:    extractChannelID(msg.SessionKey),
+		}
+
+		// Enrich with profile information if available
+		if e.profileManager != nil && msg.UserID != "" {
+			if prof := e.profileManager.GetByPlatformID(msg.Platform, msg.UserID); prof != nil {
+				req.UserID = prof.ID // Use canonical profile ID
+				if prof.DisplayName != "" {
+					// Store display name in metadata for later use
+					if req.Filters == nil {
+						req.Filters = make(map[string]any)
+					}
+					req.Filters[memory.MetadataKeyDisplayName] = prof.DisplayName
+				}
+			}
+		}
+
+		beforeResult, err := e.memoryProvider.OnBeforeChat(e.ctx, req)
+		if err != nil {
+			slog.Warn("memory OnBeforeChat failed", "error", err)
+		} else if beforeResult != nil && beforeResult.ContextText != "" {
+			// Prepend memory context to the prompt
+			promptContent = beforeResult.ContextText + "\n\n" + promptContent
+		}
+	}
+
+	// Identity: inject bot personality context before each turn
+	if e.identityManager != nil {
+		if identityCtx := e.identityManager.FormatContext(); identityCtx != "" {
+			promptContent = identityCtx + "\n\n" + promptContent
+		}
+	}
+
 	sendStart := time.Now()
 	state.mu.Lock()
 	state.fromVoice = msg.FromVoice
@@ -2312,6 +2392,32 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
 			}
 
+			// Memory: extract and store facts after conversation turn
+			if e.memoryEnabled && e.memoryProvider != nil {
+				go func() {
+					// Get conversation history for this turn
+					history := session.GetHistory(10)
+					messages := make([]memory.MemoryMessage, len(history))
+					for i, h := range history {
+						messages[i] = memory.MemoryMessage{
+							Role:    h.Role,
+							Content: h.Content,
+						}
+					}
+
+					if err := e.memoryProvider.OnAfterChat(e.ctx, memory.AfterChatRequest{
+						SessionID:  sessionKey,
+						Platform:   p.Name(),
+						UserID:     "", // userID not available in this context; memory system handles gracefully
+						ChatID:     extractChannelID(sessionKey),
+						Messages:   messages,
+						AgentReply: fullResponse,
+					}); err != nil {
+						slog.Warn("memory OnAfterChat failed", "error", err)
+					}
+				}()
+			}
+
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
 				state.mu.Lock()
@@ -2720,6 +2826,10 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdProvider(p, msg, args)
 	case "memory":
 		e.cmdMemory(p, msg, args)
+	case "identity":
+		e.cmdIdentity(p, msg, args)
+	case "profile":
+		e.cmdProfile(p, msg, args)
 	case "cron":
 		e.cmdCron(p, msg, args)
 	case "heartbeat":
@@ -6732,6 +6842,13 @@ func (e *Engine) renderUpgradeCard() *Card {
 // ──────────────────────────────────────────────────────────────
 
 func (e *Engine) cmdMemory(p Platform, msg *Message, args []string) {
+	// First try new memory provider if enabled
+	if e.memoryEnabled && e.memoryProvider != nil {
+		e.cmdMemoryProvider(p, msg, args)
+		return
+	}
+
+	// Fallback to legacy file-based memory
 	mp, ok := e.agent.(MemoryFileProvider)
 	if !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryNotSupported))
@@ -6780,6 +6897,178 @@ func (e *Engine) cmdMemory(p Platform, msg *Message, args []string) {
 	default:
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
 	}
+}
+
+// cmdMemoryProvider handles /memory command using the new memory provider.
+func (e *Engine) cmdMemoryProvider(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		// /memory — show recent memories
+		e.showMemoryProvider(p, msg, nil)
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"add", "search", "delete", "clear", "usage", "help"})
+	switch sub {
+	case "add":
+		text := strings.TrimSpace(strings.Join(args[1:], " "))
+		if text == "" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+			return
+		}
+		e.addMemoryProvider(p, msg, text)
+
+	case "search":
+		query := strings.TrimSpace(strings.Join(args[1:], " "))
+		if query == "" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSearchUsage))
+			return
+		}
+		e.searchMemoryProvider(p, msg, query)
+
+	case "delete":
+		id := strings.TrimSpace(strings.Join(args[1:], " "))
+		if id == "" {
+			e.reply(p, msg.ReplyCtx, "Usage: /memory delete <id>")
+			return
+		}
+		e.deleteMemoryProvider(p, msg, id)
+
+	case "clear":
+		e.clearMemoryProvider(p, msg)
+
+	case "usage":
+		e.showMemoryUsage(p, msg)
+
+	case "help", "--help", "-h":
+		e.reply(p, msg.ReplyCtx, `Memory commands:
+/memory [show] - Show recent memories
+/memory add <text> - Add a new memory
+/memory search <query> - Search memories
+/memory delete <id> - Delete a memory by ID
+/memory clear - Clear all memories
+/memory usage - Show memory statistics`)
+
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMemoryAddUsage))
+	}
+}
+
+// Memory Provider Methods
+// ──────────────────────────────────────────────────────────────
+
+// showMemoryProvider displays recent memories from the memory provider.
+func (e *Engine) showMemoryProvider(p Platform, msg *Message, filters map[string]any) {
+	items, err := e.memoryProvider.GetAll(e.ctx, filters)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to retrieve memories: %v", err))
+		return
+	}
+
+	if len(items) == 0 {
+		e.reply(p, msg.ReplyCtx, "No memories found.")
+		return
+	}
+
+	// Show up to 10 most recent memories
+	max := 10
+	if len(items) < max {
+		max = len(items)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Recent memories (%d total):\n\n", len(items)))
+	for i := 0; i < max; i++ {
+		item := items[i]
+		memory := item.Memory
+		if len(memory) > 200 {
+			memory = memory[:200] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, item.ID, memory))
+	}
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// addMemoryProvider adds a new memory entry.
+func (e *Engine) addMemoryProvider(p Platform, msg *Message, text string) {
+	metadata := memory.BuildProfileMetadata(msg.UserID, "", msg.UserName, msg.Platform)
+	item, err := e.memoryProvider.Add(e.ctx, memory.AddRequest{
+		Memory:   text,
+		Metadata: metadata,
+	})
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("Memory added (ID: %s)", item.ID))
+}
+
+// searchMemoryProvider searches memories by query.
+func (e *Engine) searchMemoryProvider(p Platform, msg *Message, query string) {
+	results, err := e.memoryProvider.Search(e.ctx, memory.SearchRequest{
+		Query: query,
+		Limit: 10,
+	})
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Search failed: %v", err))
+		return
+	}
+
+	if len(results.Results) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSearchNoResult))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Found %d memories:\n\n", results.Total))
+	for i, item := range results.Results {
+		memory := item.Memory
+		if len(memory) > 150 {
+			memory = memory[:150] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, item.ID, memory))
+	}
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// deleteMemoryProvider deletes a memory by ID.
+func (e *Engine) deleteMemoryProvider(p Platform, msg *Message, id string) {
+	if err := e.memoryProvider.Delete(e.ctx, id); err != nil {
+		if errors.Is(err, memory.ErrNotFound) {
+			e.reply(p, msg.ReplyCtx, "Memory not found.")
+		} else {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to delete memory: %v", err))
+		}
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("Memory %s deleted.", id))
+}
+
+// clearMemoryProvider clears all memories.
+func (e *Engine) clearMemoryProvider(p Platform, msg *Message) {
+	if err := e.memoryProvider.DeleteAll(e.ctx, nil); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to clear memories: %v", err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, "All memories cleared.")
+}
+
+// showMemoryUsage displays memory usage statistics.
+func (e *Engine) showMemoryUsage(p Platform, msg *Message) {
+	usage, err := e.memoryProvider.Usage(e.ctx, nil)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to get usage: %v", err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(
+		"Memory usage:\n- Count: %d entries\n- Total: %d bytes\n- Average: %d bytes/entry",
+		usage.Count, usage.TotalBytes, usage.AvgItemBytes,
+	))
 }
 
 func (e *Engine) showMemoryFile(p Platform, msg *Message, filePath string, isGlobal bool) {
@@ -6832,6 +7121,381 @@ func (e *Engine) appendMemoryFile(p Platform, msg *Message, filePath, text strin
 	}
 
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAdded), filePath))
+}
+
+// ──────────────────────────────────────────────────────────────
+// /identity command
+// ──────────────────────────────────────────────────────────────
+
+// cmdIdentity handles the /identity command for viewing and editing bot personality.
+func (e *Engine) cmdIdentity(p Platform, msg *Message, args []string) {
+	if e.identityManager == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgIdentityNotConfigured))
+		return
+	}
+
+	if len(args) == 0 {
+		e.showIdentity(p, msg)
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"show", "edit", "soul", "help"})
+	switch sub {
+	case "show", "":
+		e.showIdentity(p, msg)
+
+	case "edit":
+		if len(args) < 2 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgIdentityEditUsage))
+			return
+		}
+		text := strings.TrimSpace(strings.Join(args[1:], " "))
+		if text == "" {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgIdentityEditUsage))
+			return
+		}
+		e.editIdentity(p, msg, text)
+
+	case "soul":
+		if len(args) == 1 {
+			e.showSoul(p, msg)
+			return
+		}
+		sub2 := matchSubCommand(strings.ToLower(args[1]), []string{"show", "edit"})
+		switch sub2 {
+		case "show", "":
+			e.showSoul(p, msg)
+		case "edit":
+			if len(args) < 3 {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSoulEditUsage))
+				return
+			}
+			text := strings.TrimSpace(strings.Join(args[2:], " "))
+			if text == "" {
+				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSoulEditUsage))
+				return
+			}
+			e.editSoul(p, msg, text)
+		}
+
+	case "help":
+		e.showIdentityHelp(p, msg)
+
+	default:
+		e.showIdentityHelp(p, msg)
+	}
+}
+
+// showIdentity displays the current IDENTITY.md content.
+func (e *Engine) showIdentity(p Platform, msg *Message) {
+	identity := e.identityManager.Identity()
+	if identity == nil || identity.Content == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgIdentityEmpty))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("```markdown\n%s\n```", identity.Content))
+}
+
+// showSoul displays the current SOUL.md content.
+func (e *Engine) showSoul(p Platform, msg *Message) {
+	soul := e.identityManager.Soul()
+	if soul == nil || soul.Content == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSoulEmpty))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("```markdown\n%s\n```", soul.Content))
+}
+
+// editIdentity updates the IDENTITY.md file.
+func (e *Engine) editIdentity(p Platform, msg *Message, text string) {
+	if err := e.identityManager.SaveIdentity(text); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgIdentitySaveFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgIdentitySaved))
+}
+
+// editSoul updates the SOUL.md file.
+func (e *Engine) editSoul(p Platform, msg *Message, text string) {
+	if err := e.identityManager.SaveSoul(text); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSoulSaveFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSoulSaved))
+}
+
+// showIdentityHelp displays help for the /identity command.
+func (e *Engine) showIdentityHelp(p Platform, msg *Message) {
+	help := `/identity [show] - Show bot identity (IDENTITY.md)
+/identity edit <text> - Update bot identity
+/identity soul [show] - Show bot soul (SOUL.md)
+/identity soul edit <text> - Update bot soul
+/identity help - Show this help`
+	e.reply(p, msg.ReplyCtx, help)
+}
+
+// ──────────────────────────────────────────────────────────────
+// /profile command
+// ──────────────────────────────────────────────────────────────
+
+// cmdProfile handles the /profile command for viewing and managing user/group profiles.
+func (e *Engine) cmdProfile(p Platform, msg *Message, args []string) {
+	if e.profileManager == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileNotConfigured))
+		return
+	}
+
+	if len(args) == 0 {
+		e.showProfileList(p, msg)
+		return
+	}
+
+	sub := matchSubCommand(strings.ToLower(args[0]), []string{"show", "list", "user", "group", "add", "edit", "delete", "help"})
+	switch sub {
+	case "show", "":
+		if len(args) < 2 {
+			e.showProfileList(p, msg)
+			return
+		}
+		e.showProfile(p, msg, args[1])
+
+	case "list":
+		e.showProfileList(p, msg)
+
+	case "user":
+		e.showProfilesByType(p, msg, profile.TypeUser)
+
+	case "group":
+		e.showProfilesByType(p, msg, profile.TypeGroup)
+
+	case "add":
+		if len(args) < 3 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileAddUsage))
+			return
+		}
+		e.addProfile(p, msg, args[1], args[2:])
+
+	case "edit":
+		if len(args) < 3 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileEditUsage))
+			return
+		}
+		e.editProfile(p, msg, args[1], args[2:])
+
+	case "delete":
+		if len(args) < 2 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileDeleteUsage))
+			return
+		}
+		e.deleteProfile(p, msg, args[1])
+
+	case "help":
+		e.showProfileHelp(p, msg)
+
+	default:
+		e.showProfileHelp(p, msg)
+	}
+}
+
+// showProfileList displays all profiles.
+func (e *Engine) showProfileList(p Platform, msg *Message) {
+	profiles := e.profileManager.GetAll()
+	if len(profiles) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileEmpty))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Profiles (%d total):\n\n", len(profiles)))
+	for _, prof := range profiles {
+		typeIcon := "👤"
+		if prof.Type == profile.TypeGroup {
+			typeIcon = "👥"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s (ID: %s)\n", typeIcon, prof.DisplayName, prof.ID))
+	}
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// showProfile displays a single profile by ID.
+func (e *Engine) showProfile(p Platform, msg *Message, id string) {
+	prof := e.profileManager.Get(id)
+	if prof == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileNotFound))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## %s\n", prof.DisplayName))
+	sb.WriteString(fmt.Sprintf("- ID: %s\n", prof.ID))
+	sb.WriteString(fmt.Sprintf("- Type: %s\n", prof.Type))
+
+	for platform, platformID := range prof.PlatformIDs {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", platform, platformID))
+	}
+
+	for key, value := range prof.Attributes {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", key, value))
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("```markdown\n%s\n```", sb.String()))
+}
+
+// showProfilesByType displays profiles filtered by type.
+func (e *Engine) showProfilesByType(p Platform, msg *Message, typ profile.ProfileType) {
+	profiles := e.profileManager.GetByType(typ)
+	if len(profiles) == 0 {
+		typeName := "users"
+		if typ == profile.TypeGroup {
+			typeName = "groups"
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("No %s found.", typeName))
+		return
+	}
+
+	var sb strings.Builder
+	typeName := "Users"
+	if typ == profile.TypeGroup {
+		typeName = "Groups"
+	}
+	sb.WriteString(fmt.Sprintf("%s (%d total):\n\n", typeName, len(profiles)))
+	for _, prof := range profiles {
+		sb.WriteString(fmt.Sprintf("- %s (ID: %s)\n", prof.DisplayName, prof.ID))
+	}
+
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// addProfile creates a new profile.
+func (e *Engine) addProfile(p Platform, msg *Message, id string, attrs []string) {
+	// Check if ID already exists
+	if e.profileManager.Get(id) != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileAlreadyExists), id))
+		return
+	}
+
+	prof := &profile.Profile{
+		ID:          id,
+		Type:        profile.TypeUser,
+		DisplayName: id, // Default display name to ID
+		PlatformIDs: make(map[string]string),
+		Attributes:  make(map[string]string),
+	}
+
+	// Parse attributes (format: "key:value")
+	for _, attr := range attrs {
+		parts := strings.SplitN(attr, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch strings.ToLower(key) {
+		case "type":
+			if strings.ToLower(value) == "group" {
+				prof.Type = profile.TypeGroup
+			}
+		case "name":
+			prof.DisplayName = value
+		case "feishu", "telegram", "discord", "slack", "dingtalk", "wecom", "qq", "line":
+			prof.PlatformIDs[strings.ToLower(key)] = value
+		default:
+			prof.Attributes[key] = value
+		}
+	}
+
+	if err := e.profileManager.Add(prof); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileAddFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileAdded), id))
+}
+
+// editProfile modifies an existing profile.
+func (e *Engine) editProfile(p Platform, msg *Message, id string, attrs []string) {
+	prof := e.profileManager.Get(id)
+	if prof == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgProfileNotFound))
+		return
+	}
+
+	// Create a copy to edit
+	updated := &profile.Profile{
+		ID:          prof.ID,
+		Type:        prof.Type,
+		DisplayName: prof.DisplayName,
+		PlatformIDs: make(map[string]string),
+		Attributes:  make(map[string]string),
+	}
+	for k, v := range prof.PlatformIDs {
+		updated.PlatformIDs[k] = v
+	}
+	for k, v := range prof.Attributes {
+		updated.Attributes[k] = v
+	}
+
+	// Parse and apply updates
+	for _, attr := range attrs {
+		parts := strings.SplitN(attr, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch strings.ToLower(key) {
+		case "type":
+			if strings.ToLower(value) == "group" {
+				updated.Type = profile.TypeGroup
+			} else {
+				updated.Type = profile.TypeUser
+			}
+		case "name":
+			updated.DisplayName = value
+		case "feishu", "telegram", "discord", "slack", "dingtalk", "wecom", "qq", "line":
+			updated.PlatformIDs[strings.ToLower(key)] = value
+		default:
+			updated.Attributes[key] = value
+		}
+	}
+
+	if err := e.profileManager.Update(updated); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileEditFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileUpdated), id))
+}
+
+// deleteProfile removes a profile by ID.
+func (e *Engine) deleteProfile(p Platform, msg *Message, id string) {
+	if err := e.profileManager.Delete(id); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileDeleteFailed), err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProfileDeleted), id))
+}
+
+// showProfileHelp displays help for the /profile command.
+func (e *Engine) showProfileHelp(p Platform, msg *Message) {
+	help := `/profile [list] - List all profiles
+/profile show <id> - Show profile details
+/profile user - List all user profiles
+/profile group - List all group profiles
+/profile add <id> <attr:value>... - Add new profile
+  Example: /profile add user_001 name:张三 telegram:@zhangsan feishu:ou_xxx
+/profile edit <id> <attr:value>... - Edit profile
+/profile delete <id> - Delete profile
+/profile help - Show this help`
+	e.reply(p, msg.ReplyCtx, help)
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -441,6 +441,32 @@ const (
 	MsgSearchResult   MsgKey = "search_result"
 	MsgSearchHint     MsgKey = "search_hint"
 
+	// Identity messages
+	MsgIdentityNotConfigured MsgKey = "identity_not_configured"
+	MsgIdentityEmpty         MsgKey = "identity_empty"
+	MsgIdentityEditUsage     MsgKey = "identity_edit_usage"
+	MsgIdentitySaveFailed    MsgKey = "identity_save_failed"
+	MsgIdentitySaved         MsgKey = "identity_saved"
+	MsgSoulEmpty             MsgKey = "soul_empty"
+	MsgSoulEditUsage         MsgKey = "soul_edit_usage"
+	MsgSoulSaveFailed        MsgKey = "soul_save_failed"
+	MsgSoulSaved             MsgKey = "soul_saved"
+
+	// Profile messages
+	MsgProfileNotConfigured MsgKey = "profile_not_configured"
+	MsgProfileEmpty         MsgKey = "profile_empty"
+	MsgProfileNotFound      MsgKey = "profile_not_found"
+	MsgProfileAlreadyExists MsgKey = "profile_already_exists"
+	MsgProfileAddUsage      MsgKey = "profile_add_usage"
+	MsgProfileAddFailed     MsgKey = "profile_add_failed"
+	MsgProfileAdded         MsgKey = "profile_added"
+	MsgProfileEditUsage     MsgKey = "profile_edit_usage"
+	MsgProfileEditFailed    MsgKey = "profile_edit_failed"
+	MsgProfileUpdated       MsgKey = "profile_updated"
+	MsgProfileDeleteUsage   MsgKey = "profile_delete_usage"
+	MsgProfileDeleteFailed  MsgKey = "profile_delete_failed"
+	MsgProfileDeleted       MsgKey = "profile_deleted"
+
 	MsgBuiltinCmdNew       MsgKey = "new"
 	MsgBuiltinCmdList      MsgKey = "list"
 	MsgBuiltinCmdSearch    MsgKey = "search"
@@ -3325,6 +3351,162 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 克隆倉庫失敗: %v",
 		LangJapanese:           "❌ リポジトリのクローンに失敗しました: %v",
 		LangSpanish:            "❌ Error al clonar repositorio: %v",
+	},
+	// Identity messages
+	MsgIdentityNotConfigured: {
+		LangEnglish:            "Identity system is not configured.",
+		LangChinese:            "身份系统未配置。",
+		LangTraditionalChinese: "身份系統未配置。",
+		LangJapanese:           "アイデンティティシステムが設定されていません。",
+		LangSpanish:            "El sistema de identidad no está configurado.",
+	},
+	MsgIdentityEmpty: {
+		LangEnglish:            "IDENTITY.md is empty or not found.",
+		LangChinese:            "IDENTITY.md 为空或不存在。",
+		LangTraditionalChinese: "IDENTITY.md 為空或不存在。",
+		LangJapanese:           "IDENTITY.md が空か見つかりません。",
+		LangSpanish:            "IDENTITY.md está vacío o no se encontró.",
+	},
+	MsgIdentityEditUsage: {
+		LangEnglish:            "Usage: /identity edit <text>",
+		LangChinese:            "用法: /identity edit <文本>",
+		LangTraditionalChinese: "用法: /identity edit <文本>",
+		LangJapanese:           "使い方: /identity edit <テキスト>",
+		LangSpanish:            "Uso: /identity edit <texto>",
+	},
+	MsgIdentitySaveFailed: {
+		LangEnglish:            "Failed to save identity: %v",
+		LangChinese:            "保存身份失败: %v",
+		LangTraditionalChinese: "保存身份失敗: %v",
+		LangJapanese:           "アイデンティティの保存に失敗しました: %v",
+		LangSpanish:            "Error al guardar identidad: %v",
+	},
+	MsgIdentitySaved: {
+		LangEnglish:            "Identity saved successfully.",
+		LangChinese:            "身份保存成功。",
+		LangTraditionalChinese: "身份保存成功。",
+		LangJapanese:           "アイデンティティを保存しました。",
+		LangSpanish:            "Identidad guardada exitosamente.",
+	},
+	MsgSoulEmpty: {
+		LangEnglish:            "SOUL.md is empty or not found.",
+		LangChinese:            "SOUL.md 为空或不存在。",
+		LangTraditionalChinese: "SOUL.md 為空或不存在。",
+		LangJapanese:           "SOUL.md が空か見つかりません。",
+		LangSpanish:            "SOUL.md está vacío o no se encontró.",
+	},
+	MsgSoulEditUsage: {
+		LangEnglish:            "Usage: /identity soul edit <text>",
+		LangChinese:            "用法: /identity soul edit <文本>",
+		LangTraditionalChinese: "用法: /identity soul edit <文本>",
+		LangJapanese:           "使い方: /identity soul edit <テキスト>",
+		LangSpanish:            "Uso: /identity soul edit <texto>",
+	},
+	MsgSoulSaveFailed: {
+		LangEnglish:            "Failed to save soul: %v",
+		LangChinese:            "保存 soul 失败: %v",
+		LangTraditionalChinese: "保存 soul 失敗: %v",
+		LangJapanese:           "soul の保存に失敗しました: %v",
+		LangSpanish:            "Error al guardar soul: %v",
+	},
+	MsgSoulSaved: {
+		LangEnglish:            "Soul saved successfully.",
+		LangChinese:            "Soul 保存成功。",
+		LangTraditionalChinese: "Soul 保存成功。",
+		LangJapanese:           "soul を保存しました。",
+		LangSpanish:            "Soul guardado exitosamente.",
+	},
+	// Profile messages
+	MsgProfileNotConfigured: {
+		LangEnglish:            "Profile system is not configured.",
+		LangChinese:            "档案系统未配置。",
+		LangTraditionalChinese: "檔案系統未配置。",
+		LangJapanese:           "プロファイルシステムが設定されていません。",
+		LangSpanish:            "El sistema de perfiles no está configurado.",
+	},
+	MsgProfileEmpty: {
+		LangEnglish:            "No profiles found.",
+		LangChinese:            "未找到档案。",
+		LangTraditionalChinese: "未找到檔案。",
+		LangJapanese:           "プロファイルが見つかりません。",
+		LangSpanish:            "No se encontraron perfiles.",
+	},
+	MsgProfileNotFound: {
+		LangEnglish:            "Profile not found.",
+		LangChinese:            "档案不存在。",
+		LangTraditionalChinese: "檔案不存在。",
+		LangJapanese:           "プロファイルが見つかりません。",
+		LangSpanish:            "Perfil no encontrado.",
+	},
+	MsgProfileAlreadyExists: {
+		LangEnglish:            "Profile '%s' already exists.",
+		LangChinese:            "档案 '%s' 已存在。",
+		LangTraditionalChinese: "檔案 '%s' 已存在。",
+		LangJapanese:           "プロファイル '%s' は既に存在します。",
+		LangSpanish:            "El perfil '%s' ya existe.",
+	},
+	MsgProfileAddUsage: {
+		LangEnglish:            "Usage: /profile add <id> <attr:value>...",
+		LangChinese:            "用法: /profile add <id> <属性:值>...",
+		LangTraditionalChinese: "用法: /profile add <id> <屬性:值>...",
+		LangJapanese:           "使い方: /profile add <id> <属性:値>...",
+		LangSpanish:            "Uso: /profile add <id> <attr:valor>...",
+	},
+	MsgProfileAddFailed: {
+		LangEnglish:            "Failed to add profile: %v",
+		LangChinese:            "添加档案失败: %v",
+		LangTraditionalChinese: "添加檔案失敗: %v",
+		LangJapanese:           "プロファイルの追加に失敗しました: %v",
+		LangSpanish:            "Error al agregar perfil: %v",
+	},
+	MsgProfileAdded: {
+		LangEnglish:            "Profile '%s' added successfully.",
+		LangChinese:            "档案 '%s' 添加成功。",
+		LangTraditionalChinese: "檔案 '%s' 添加成功。",
+		LangJapanese:           "プロファイル '%s' を追加しました。",
+		LangSpanish:            "Perfil '%s' agregado exitosamente.",
+	},
+	MsgProfileEditUsage: {
+		LangEnglish:            "Usage: /profile edit <id> <attr:value>...",
+		LangChinese:            "用法: /profile edit <id> <属性:值>...",
+		LangTraditionalChinese: "用法: /profile edit <id> <屬性:值>...",
+		LangJapanese:           "使い方: /profile edit <id> <属性:値>...",
+		LangSpanish:            "Uso: /profile edit <id> <attr:valor>...",
+	},
+	MsgProfileEditFailed: {
+		LangEnglish:            "Failed to edit profile: %v",
+		LangChinese:            "编辑档案失败: %v",
+		LangTraditionalChinese: "編輯檔案失敗: %v",
+		LangJapanese:           "プロファイルの編集に失敗しました: %v",
+		LangSpanish:            "Error al editar perfil: %v",
+	},
+	MsgProfileUpdated: {
+		LangEnglish:            "Profile '%s' updated successfully.",
+		LangChinese:            "档案 '%s' 更新成功。",
+		LangTraditionalChinese: "檔案 '%s' 更新成功。",
+		LangJapanese:           "プロファイル '%s' を更新しました。",
+		LangSpanish:            "Perfil '%s' actualizado exitosamente.",
+	},
+	MsgProfileDeleteUsage: {
+		LangEnglish:            "Usage: /profile delete <id>",
+		LangChinese:            "用法: /profile delete <id>",
+		LangTraditionalChinese: "用法: /profile delete <id>",
+		LangJapanese:           "使い方: /profile delete <id>",
+		LangSpanish:            "Uso: /profile delete <id>",
+	},
+	MsgProfileDeleteFailed: {
+		LangEnglish:            "Failed to delete profile: %v",
+		LangChinese:            "删除档案失败: %v",
+		LangTraditionalChinese: "刪除檔案失敗: %v",
+		LangJapanese:           "プロファイルの削除に失敗しました: %v",
+		LangSpanish:            "Error al eliminar perfil: %v",
+	},
+	MsgProfileDeleted: {
+		LangEnglish:            "Profile '%s' deleted successfully.",
+		LangChinese:            "档案 '%s' 删除成功。",
+		LangTraditionalChinese: "檔案 '%s' 刪除成功。",
+		LangJapanese:           "プロファイル '%s' を削除しました。",
+		LangSpanish:            "Perfil '%s' eliminado exitosamente.",
 	},
 }
 
